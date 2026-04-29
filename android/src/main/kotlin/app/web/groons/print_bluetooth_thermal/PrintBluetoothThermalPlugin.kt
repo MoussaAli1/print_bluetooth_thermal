@@ -156,29 +156,40 @@ class PrintBluetoothThermalPlugin: FlutterPlugin, MethodCallHandler {
       }
       val bytes: ByteArray = "\n".toByteArray() + userBytes
 
-    if (outputStream != null) {
-        try {
-            val chunkSize = 16 * 1024 // 16 KB
-            val total = bytes.size
-            var offset = 0
+      val stream = outputStream
+      if (stream == null) {
+          result.success(false)
+          return
+      }
 
-            outputStream?.run {
-                while (offset < total) {
-                    val end = minOf(offset + chunkSize, total)
-                    write(bytes, offset, end - offset)
-                    flush()
-                    offset = end
-                }
-                result.success(true)
-            }
-        } catch (e: Exception) {
-            result.success(false)
-            outputStream = null
-            Log.e(TAG, "Error al imprimir: ${e.message}", e)
-        }
-    } else {
-        result.success(false)
-    }
+      // Run the actual BT write on a background dispatcher. Some printers
+      // (especially label printers with cutters) drain their BT receive
+      // buffer slowly while a mechanical operation is in progress. If we run
+      // the write on the platform/main thread, OutputStream.write() blocks
+      // until the printer's buffer has space — freezing the UI thread for
+      // multiple seconds and triggering ANR. With Dispatchers.IO the main
+      // thread stays free; we post result.success back via withContext(Main).
+      GlobalScope.launch(Dispatchers.IO) {
+          var ok = false
+          try {
+              val chunkSize = 16 * 1024 // 16 KB
+              val total = bytes.size
+              var offset = 0
+              while (offset < total) {
+                  val end = minOf(offset + chunkSize, total)
+                  stream.write(bytes, offset, end - offset)
+                  stream.flush()
+                  offset = end
+              }
+              ok = true
+          } catch (e: Exception) {
+              outputStream = null
+              Log.e(TAG, "Error al imprimir: ${e.message}", e)
+          }
+          withContext(Dispatchers.Main) {
+              result.success(ok)
+          }
+      }
     }else if (call.method == "printstring") {
       var stringllego: String = call.arguments.toString()
       //var lista = stringllego.split("*")
