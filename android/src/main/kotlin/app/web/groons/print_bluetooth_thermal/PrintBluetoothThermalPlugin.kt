@@ -169,18 +169,18 @@ class PrintBluetoothThermalPlugin: FlutterPlugin, MethodCallHandler {
       // until the printer's buffer has space — freezing the UI thread for
       // multiple seconds and triggering ANR. With Dispatchers.IO the main
       // thread stays free; we post result.success back via withContext(Main).
+      //
+      // Write the entire buffer in one call and flush only at the end. The
+      // previous implementation flushed after every 16KB chunk, which forced
+      // a Bluetooth socket drain per chunk and added ~50-100ms of round-trip
+      // latency × N chunks. For a 600KB bulk that's potentially several
+      // seconds of pure overhead. Letting the OS handle BT packet chunking
+      // is significantly faster on bulk transfers.
       GlobalScope.launch(Dispatchers.IO) {
           var ok = false
           try {
-              val chunkSize = 16 * 1024 // 16 KB
-              val total = bytes.size
-              var offset = 0
-              while (offset < total) {
-                  val end = minOf(offset + chunkSize, total)
-                  stream.write(bytes, offset, end - offset)
-                  stream.flush()
-                  offset = end
-              }
+              stream.write(bytes)
+              stream.flush()
               ok = true
           } catch (e: Exception) {
               outputStream = null
