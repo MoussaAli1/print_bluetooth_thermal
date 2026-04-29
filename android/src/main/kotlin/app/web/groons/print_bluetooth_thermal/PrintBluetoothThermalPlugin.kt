@@ -142,12 +142,19 @@ class PrintBluetoothThermalPlugin: FlutterPlugin, MethodCallHandler {
         }
       }
     }else if (call.method == "writebytes") {
-      val lista: List<Int> = call.arguments as List<Int>
-    var bytes: ByteArray = "\n".toByteArray()
-
-    lista.forEach {
-        bytes += it.toByte()
-    }
+      // Accept either ByteArray (fast path, marshalled from Dart Uint8List —
+      // no per-element Integer boxing) or List<Int> (legacy path, kept for
+      // backward compatibility with callers that still pass List<int>).
+      val rawArgs = call.arguments
+      val userBytes: ByteArray = when (rawArgs) {
+          is ByteArray -> rawArgs
+          is List<*> -> ByteArray(rawArgs.size) { i -> (rawArgs[i] as Int).toByte() }
+          else -> {
+              result.success(false)
+              return
+          }
+      }
+      val bytes: ByteArray = "\n".toByteArray() + userBytes
 
     if (outputStream != null) {
         try {

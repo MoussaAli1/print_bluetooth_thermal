@@ -117,6 +117,24 @@ class PrintBluetoothThermal {
     }
   }
 
+  /// Send raw bytes via [Uint8List]. ~30x faster than [writeBytes] for large
+  /// payloads because Flutter's method channel marshals a `Uint8List` as a
+  /// single primitive `byte[]` on the Android side — no per-element `Integer`
+  /// boxing. Use this for big writes (e.g. label bitmaps) to avoid blocking
+  /// the main isolate during channel encoding.
+  static Future<bool> writeBytesRaw(Uint8List bytes) async {
+    if (Platform.isWindows) {
+      return await PrintBluetoothThermalWindows.writeBytes(bytes: bytes.toList());
+    } else {
+      try {
+        return await _channel.invokeMethod('writebytes', bytes);
+      } on PlatformException catch (e) {
+        if (kDebugMode) print("Failed to writeBytesRaw: '${e.message}'.");
+        return false;
+      }
+    }
+  }
+
   ///Strings are sent to be printed by the PrintTextSize class can if(kDebugMode) print from size 1 (50%) to size 5 (400%)
   static Future<bool> writeString({required PrintTextSize printText}) async {
     ///EN: you must send the enter \n to if(kDebugMode) print the complete phrase, it is not sent automatically because you may want to add several
