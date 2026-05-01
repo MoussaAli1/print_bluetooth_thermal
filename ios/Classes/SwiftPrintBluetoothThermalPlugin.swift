@@ -20,7 +20,9 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegat
     // writeReadySemaphore is signaled by peripheralIsReadyToSendWriteWithoutResponse
     // when the BLE outbound queue has room for the next chunk.
     let writeReadySemaphore = DispatchSemaphore(value: 0)
+    let writeResponseSemaphore = DispatchSemaphore(value: 0)
     var writeQueueIsBlocked = false
+    var lastWriteError: Error?
 
     // En el método init, inicializa el gestor central con un delegado
     //para solicitar el permiso del bluetooth
@@ -195,29 +197,43 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegat
         // chunks too quickly even with BLE queue flow control. Use conservative
         // 20-byte chunks for that service; keep larger chunks for others.
         let chunkSize = is4953Bridge ? 20 : max(20, min(mtu, 182))
-        let writeType: CBCharacteristicWriteType = .withoutResponse
+        let supportsWithoutResponse = characteristic.properties.contains(.writeWithoutResponse)
+        let supportsWithResponse = characteristic.properties.contains(.write)
+        let writeType: CBCharacteristicWriteType
+        if supportsWithoutResponse {
+            writeType = .withoutResponse
+        } else if supportsWithResponse {
+            writeType = .withResponse
+        } else {
+            print("writebytes: target characteristic is not writable")
+            result(false)
+            return
+        }
         let totalBytes = data.count
 
         DispatchQueue.global(qos: .userInitiated).async {
-            print("writebytes: starting \(totalBytes) bytes, chunk=\(chunkSize), withoutResponse, mtu=\(mtu), bridge4953=\(is4953Bridge)")
+            self.lastWriteError = nil
+            print("writebytes: starting \(totalBytes) bytes, chunk=\(chunkSize), type=\(writeType == .withResponse ? "withResponse" : "withoutResponse"), mtu=\(mtu), bridge4953=\(is4953Bridge)")
             let startedAt = Date()
             var offset = 0
             var sentChunks = 0
             while offset < totalBytes {
-                // Block here if iOS's outbound queue is full. We mark the
-                // queue as blocked so the delegate knows to signal us.
-                var canSend = false
-                DispatchQueue.main.sync {
-                    canSend = peripheral.canSendWriteWithoutResponse
-                    if !canSend { self.writeQueueIsBlocked = true }
-                }
-                if !canSend {
-                    // Wait up to 5s for capacity. If timeout, abort.
-                    let waitResult = self.writeReadySemaphore.wait(timeout: .now() + 5.0)
-                    if waitResult == .timedOut {
-                        print("writebytes: timed out waiting for BLE queue capacity at offset \(offset)")
-                        DispatchQueue.main.async { result(false) }
-                        return
+                if writeType == .withoutResponse {
+                    // Block here if iOS's outbound queue is full. We mark the
+                    // queue as blocked so the delegate knows to signal us.
+                    var canSend = false
+                    DispatchQueue.main.sync {
+                        canSend = peripheral.canSendWriteWithoutResponse
+                        if !canSend { self.writeQueueIsBlocked = true }
+                    }
+                    if !canSend {
+                        // Wait up to 5s for capacity. If timeout, abort.
+                        let waitResult = self.writeReadySemaphore.wait(timeout: .now() + 5.0)
+                        if waitResult == .timedOut {
+                            print("writebytes: timed out waiting for BLE queue capacity at offset \(offset)")
+                            DispatchQueue.main.async { result(false) }
+                            return
+                        }
                     }
                 }
 
@@ -226,6 +242,21 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegat
                 DispatchQueue.main.sync {
                     peripheral.writeValue(chunkData, for: characteristic, type: writeType)
                 }
+
+                if writeType == .withResponse {
+                    let ack = self.writeResponseSemaphore.wait(timeout: .now() + 5.0)
+                    if ack == .timedOut {
+                        print("writebytes: timed out waiting for didWriteValueFor at offset \(offset)")
+                        DispatchQueue.main.async { result(false) }
+                        return
+                    }
+                    if self.lastWriteError != nil {
+                        print("writebytes: didWriteValueFor returned error at offset \(offset)")
+                        DispatchQueue.main.async { result(false) }
+                        return
+                    }
+                }
+
                 offset += chunkSize
                 sentChunks += 1
 
@@ -441,13 +472,14 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegat
 
     // Implementación del método peripheral(_:didWriteValueFor:error:) para saber si la impresion fue exitosa si se pasa .withResponse
     public func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
-        if let error = error {
-           print("Error al escribir en la característica: \(error.localizedDescription)")
-            self.flutterResult?(false)
-           return
-        }
-         self.flutterResult?(true)
-        // Aquí puedes realizar operaciones adicionales con la respuesta de la escritura
+          if let error = error {
+              print("Error al escribir en la característica: \(error.localizedDescription)")
+              self.lastWriteError = error
+          } else {
+              self.lastWriteError = nil
+          }
+          // Signal waiting write loop for .withResponse flow control.
+          self.writeResponseSemaphore.signal()
     }
 
     // Flow control for .withoutResponse writes — fires when iOS has freed
