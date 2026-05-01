@@ -5,7 +5,7 @@ import CoreBluetooth
 public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate,  FlutterPlugin {
     var centralManager: CBCentralManager?  // Define una variable para guardar el gestor central de bluetooth
     var discoveredDevices: [String] = []  //lista de bluetooths encontrados
-    var connectedPeripheral: CBPeripheral!  //dispositivo conectado
+    var connectedPeripheral: CBPeripheral?  //dispositivo conectado
     var targetService: CBService? // Variable global para el servicio objetivo
     //var characteristics: [CBCharacteristic] = [] // Variable global para almacenar las características encontradas
     var targetCharacteristic: CBCharacteristic? // Variable global para almacenar la característica objetivo
@@ -14,6 +14,12 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegat
     var flutterResult: FlutterResult? //para el resul de flutter
     var bytes: [UInt8]? //variable para almacenar los bytes que llegan
     var stringprint = ""; //variable para almacenar los string que llegan
+
+    // Flow-control state for chunked writes.
+    // writeReadySemaphore is signaled by peripheralIsReadyToSendWriteWithoutResponse
+    // when the BLE outbound queue has room for the next chunk.
+    let writeReadySemaphore = DispatchSemaphore(value: 0)
+    var writeQueueIsBlocked = false
 
     // En el método init, inicializa el gestor central con un delegado
     //para solicitar el permiso del bluetooth
@@ -105,9 +111,13 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegat
 
     } 
     else if call.method == "connect"{
-        let macAddress = call.arguments as! String 
+        guard let macAddress = call.arguments as? String,
+              let uuid = UUID(uuidString: macAddress) else {
+          result(false)
+          return
+        }
         // Busca el dispositivo con la dirección MAC dada
-        let peripherals = centralManager?.retrievePeripherals(withIdentifiers: [UUID(uuidString: macAddress)!])
+        let peripherals = centralManager?.retrievePeripherals(withIdentifiers: [uuid])
         guard let peripheral = peripherals?.first else {
           //print("No se encontró ningún dispositivo con la dirección MAC \(macAddress)")
           result(false)
@@ -123,7 +133,7 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegat
                 //print("Conexión exitosa con el dispositivo \(peripheral.name ?? "Desconocido")")
                 self.connectedPeripheral = peripheral
 
-                self.connectedPeripheral.delegate = self
+                self.connectedPeripheral?.delegate = self
                 // Discover services of the connected peripheral
                 //se ejecuta los servicios descubiertos en primer peripheral
                 self.connectedPeripheral?.discoverServices(nil)
@@ -143,49 +153,113 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegat
           result(false)
       }
     }else if call.method == "writebytes"{
-        guard let arguments = call.arguments as? [Int] else {
-          // Manejar el caso en que los argumentos no son del tipo esperado
-          return
+        // Accept either:
+        //  - FlutterStandardTypedData (Uint8List from Dart — used by writeBytesRaw)
+        //  - [Int] / [UInt8] (legacy List<int> path used by writeBytes)
+        var data: Data
+        if let typed = call.arguments as? FlutterStandardTypedData {
+            data = typed.data
+        } else if let intArr = call.arguments as? [Int] {
+            data = Data(intArr.map { UInt8(truncatingIfNeeded: $0) })
+        } else if let byteArr = call.arguments as? [UInt8] {
+            data = Data(byteArr)
+        } else {
+            print("writebytes: invalid arguments type: \(type(of: call.arguments))")
+            result(false)
+            return
         }
-        //let bytes = arguments
-        self.bytes = arguments.map { UInt8($0) } //No se esta usando
 
-        if let characteristic = targetCharacteristic {
-            // Utiliza la variable characteristic desempaquetada aquí
-            //print("bytes count: \(self.bytes?.count)")
-            guard let listbytes = call.arguments as? [UInt8] else {
-                // Manejar el caso en que los argumentos no son del tipo esperado
-                return
-            }
-            //self.connectedPeripheral?.writeValue(Data(listbytes), for: characteristic, type: .withoutResponse) //.withResponse, .withoutResponse
+        guard let characteristic = targetCharacteristic, let peripheral = self.connectedPeripheral else {
+            print("writebytes: no target characteristic / peripheral")
+            result(false)
+            return
+        }
 
-            //Imprimir bloques de 150 bytes en la impresora para que no se sature
-            let data: Data = Data(listbytes) // Datos que deseas imprimir
-            let chunkSize = 150 // Tamaño de cada fragmento en bytes
+        // Use writeWithoutResponse with proper flow control via
+        // peripheralIsReadyToSendWriteWithoutResponse. This is iOS's
+        // documented high-throughput pattern — writeValue with .withResponse
+        // requires waiting for didWriteValueFor between EACH call (one
+        // outstanding at a time), and naïvely fire-and-forget drops every
+        // call after the first. With unacked writes we can fill iOS's
+        // outbound queue; when canSendWriteWithoutResponse returns false
+        // we block until the delegate signals capacity is available.
+        let mtu = peripheral.maximumWriteValueLength(for: .withoutResponse)
+        let chunkSize = max(20, min(mtu, 182))
+        let writeType: CBCharacteristicWriteType = .withoutResponse
+        let totalBytes = data.count
 
+        DispatchQueue.global(qos: .userInitiated).async {
+            print("writebytes: starting \(totalBytes) bytes, chunk=\(chunkSize), withoutResponse, mtu=\(mtu)")
+            let startedAt = Date()
             var offset = 0
-            while offset < data.count {
-                let chunkRange = offset..<min(offset + chunkSize, data.count)
-                let chunkData = data.subdata(in: chunkRange)
-                //print("chunkData count: \(chunkData.count)")
-                // Envía el fragmento para imprimir utilizando la característica deseada
-
-                var writeType = CBCharacteristicWriteType.withoutResponse;
-                if characteristic.properties.contains(.write) {
-                   writeType = CBCharacteristicWriteType.withResponse;
+            while offset < totalBytes {
+                // Block here if iOS's outbound queue is full. We mark the
+                // queue as blocked so the delegate knows to signal us.
+                var canSend = false
+                DispatchQueue.main.sync {
+                    canSend = peripheral.canSendWriteWithoutResponse
+                    if !canSend { self.writeQueueIsBlocked = true }
+                }
+                if !canSend {
+                    // Wait up to 5s for capacity. If timeout, abort.
+                    let waitResult = self.writeReadySemaphore.wait(timeout: .now() + 5.0)
+                    if waitResult == .timedOut {
+                        print("writebytes: timed out waiting for BLE queue capacity at offset \(offset)")
+                        DispatchQueue.main.async { result(false) }
+                        return
+                    }
                 }
 
-                 self.connectedPeripheral?.writeValue(chunkData, for: characteristic, type: writeType)
-                   
+                let chunkRange = offset..<min(offset + chunkSize, totalBytes)
+                let chunkData = data.subdata(in: chunkRange)
+                DispatchQueue.main.sync {
+                    peripheral.writeValue(chunkData, for: characteristic, type: writeType)
+                }
                 offset += chunkSize
             }
-            //la respuesta va en peripheral
-            //self.flutterResult?(true)
-        } else {
-            print("No hay caracteristica para imprimir")
+            let elapsed = Date().timeIntervalSince(startedAt)
+            print("writebytes: SENT \(totalBytes) bytes in \(String(format: "%.2f", elapsed))s")
+            DispatchQueue.main.async {
+                result(true)
+            }
+        }
+        return
+
+      } else if call.method == "writebytesraw" {
+        // Fast-path: bytes arrive as FlutterStandardTypedData (Uint8List on
+        // the Dart side) so no per-element boxing is required.
+        guard let typed = call.arguments as? FlutterStandardTypedData else {
+            print("writebytesraw: invalid arguments")
             result(false)
+            return
+        }
+        let data = typed.data
+
+        guard let characteristic = targetCharacteristic else {
+            print("writebytesraw: no target characteristic")
+            result(false)
+            return
         }
 
+        // Send in 150-byte chunks (same as writebytes) to avoid saturating the
+        // BLE write buffer. Use withResponse when the characteristic supports
+        // it so flow-control back-pressure is honored.
+        let chunkSize = 150
+        var writeType: CBCharacteristicWriteType = .withoutResponse
+        if characteristic.properties.contains(.write) {
+            writeType = .withResponse
+        }
+
+        var offset = 0
+        while offset < data.count {
+            let chunkRange = offset..<min(offset + chunkSize, data.count)
+            let chunkData = data.subdata(in: chunkRange)
+            self.connectedPeripheral?.writeValue(chunkData, for: characteristic, type: writeType)
+            offset += chunkSize
+        }
+
+        result(true)
+        return
       } else if call.method == "printstring"{
         self.stringprint = call.arguments as! String
         //print("llego a printstring\(self.stringprint)")
@@ -241,7 +315,12 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegat
             result(false)
         }
         } else if call.method == "disconnect"{
-        centralManager?.cancelPeripheralConnection(connectedPeripheral)
+        if let peripheralToDisconnect = connectedPeripheral {
+            centralManager?.cancelPeripheralConnection(peripheralToDisconnect)
+        } else {
+            // Nothing to disconnect from; reply success and clean state.
+            self.flutterResult?(true)
+        }
         targetCharacteristic = nil
         //la respuesta va en centralManager segunda funcion
         //result(true)
@@ -348,8 +427,17 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegat
            return
         }
          self.flutterResult?(true)
-        print("Escritura exitosa en la característica: \(characteristic.uuid)")
         // Aquí puedes realizar operaciones adicionales con la respuesta de la escritura
+    }
+
+    // Flow control for .withoutResponse writes — fires when iOS has freed
+    // capacity in its outbound BLE queue. We wake the writebytes worker
+    // thread so it can send the next chunk.
+    public func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        if self.writeQueueIsBlocked {
+            self.writeQueueIsBlocked = false
+            self.writeReadySemaphore.signal()
+        }
     }
     
     public func centralManagerDidUpdateState(_ central: CBCentralManager) {
