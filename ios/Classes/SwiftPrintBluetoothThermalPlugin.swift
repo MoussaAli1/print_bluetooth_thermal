@@ -370,17 +370,10 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegat
                    ]
 
                    if allowedServices.contains(service.uuid) {
-                       print("Service found: \(service.uuid)") 
-                       // Por ejemplo, puedes descubrir las características del servicio
+                       print("Service found: \(service.uuid)")
                        peripheral.discoverCharacteristics(nil, for: service)
-
-                       // También puedes almacenar el servicio en una variable para futuras referencias
-                       // targetService = service
-                       self.targetService = service;
+                       self.targetService = service
                    }
-
-                   // Aquí puedes realizar operaciones adicionales con cada servicio encontrado, como descubrir características
-                   peripheral.discoverCharacteristics(nil, for: service)
                }
            }
     }
@@ -393,28 +386,38 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegat
         }
 
         if let discoveredCharacteristics = service.characteristics {
-            for characteristic in discoveredCharacteristics {
-                //print("characteristics found: \(characteristic.uuid)")
-            
-                let allowedCharacteristics = [
-                    CBUUID(string: "00001101-0000-1000-8000-00805F9B34FB"), 
-                    CBUUID(string: "49535343-8841-43F4-A8D4-ECBE34729BB3"), 
-                    CBUUID(string: "A76EB9E2-F3AC-4990-84CF-3A94D2426B2B")
-                ]
+            // Known printer TX characteristics by priority.
+            // Many BLE thermal modules use 1E4D as TX (write) and 8841 as RX/notify.
+            let priority: [CBUUID] = [
+                CBUUID(string: "49535343-1E4D-4BD9-BA61-23C647249616"),
+                CBUUID(string: "49535343-8841-43F4-A8D4-ECBE34729BB3"),
+                CBUUID(string: "A76EB9E2-F3AC-4990-84CF-3A94D2426B2B"),
+                CBUUID(string: "00001101-0000-1000-8000-00805F9B34FB")
+            ]
 
-                if allowedCharacteristics.contains(characteristic.uuid) {
-                    targetCharacteristic = characteristic // Guarda la característica objetivo en la variable global
-                    print("Target characteristic found: \(characteristic.uuid)")
-                 
-                    if characteristic.properties.contains(.write) {
-                        // La característica admite escritura
-                        print("characteristics found: \(characteristic.uuid) La característica admite escritura")
-                    } else {
-                        // La característica no admite escritura
-                        print("characteristics found: \(characteristic.uuid) La característica no admite escritura")
+            var selected: CBCharacteristic?
+
+            for preferred in priority {
+                if let c = discoveredCharacteristics.first(where: { $0.uuid == preferred }) {
+                    let writable = c.properties.contains(.write) || c.properties.contains(.writeWithoutResponse)
+                    print("characteristics found: \(c.uuid) writable=\(writable) props=\(c.properties.rawValue)")
+                    if writable {
+                        selected = c
+                        break
                     }
-                    break
                 }
+            }
+
+            // Fallback: any writable characteristic in this service.
+            if selected == nil {
+                selected = discoveredCharacteristics.first(where: {
+                    $0.properties.contains(.write) || $0.properties.contains(.writeWithoutResponse)
+                })
+            }
+
+            if let chosen = selected {
+                targetCharacteristic = chosen
+                print("Target characteristic found: \(chosen.uuid) props=\(chosen.properties.rawValue)")
             }
         }
     }
