@@ -189,14 +189,20 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegat
         // outbound queue; when canSendWriteWithoutResponse returns false
         // we block until the delegate signals capacity is available.
         let mtu = peripheral.maximumWriteValueLength(for: .withoutResponse)
-        let chunkSize = max(20, min(mtu, 182))
+        let printerServiceUUID = CBUUID(string: "49535343-FE7D-4AE5-8FA9-9FAFD205E455")
+        let is4953Bridge = (self.targetService?.uuid == printerServiceUUID)
+        // BM78/ISSC-style 49535343 bridges often drop bytes when fed large
+        // chunks too quickly even with BLE queue flow control. Use conservative
+        // 20-byte chunks for that service; keep larger chunks for others.
+        let chunkSize = is4953Bridge ? 20 : max(20, min(mtu, 182))
         let writeType: CBCharacteristicWriteType = .withoutResponse
         let totalBytes = data.count
 
         DispatchQueue.global(qos: .userInitiated).async {
-            print("writebytes: starting \(totalBytes) bytes, chunk=\(chunkSize), withoutResponse, mtu=\(mtu)")
+            print("writebytes: starting \(totalBytes) bytes, chunk=\(chunkSize), withoutResponse, mtu=\(mtu), bridge4953=\(is4953Bridge)")
             let startedAt = Date()
             var offset = 0
+            var sentChunks = 0
             while offset < totalBytes {
                 // Block here if iOS's outbound queue is full. We mark the
                 // queue as blocked so the delegate knows to signal us.
@@ -221,6 +227,16 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegat
                     peripheral.writeValue(chunkData, for: characteristic, type: writeType)
                 }
                 offset += chunkSize
+                sentChunks += 1
+
+                // Additional pacing for 4953 bridges to avoid overflowing the
+                // BLE->UART RX buffer in the printer module.
+                if is4953Bridge {
+                    Thread.sleep(forTimeInterval: 0.002)
+                    if sentChunks % 25 == 0 {
+                        Thread.sleep(forTimeInterval: 0.010)
+                    }
+                }
             }
             let elapsed = Date().timeIntervalSince(startedAt)
             print("writebytes: SENT \(totalBytes) bytes in \(String(format: "%.2f", elapsed))s")
