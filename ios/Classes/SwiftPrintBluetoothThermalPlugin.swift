@@ -9,6 +9,7 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegat
     var targetService: CBService? // Variable global para el servicio objetivo
     //var characteristics: [CBCharacteristic] = [] // Variable global para almacenar las características encontradas
     var targetCharacteristic: CBCharacteristic? // Variable global para almacenar la característica objetivo
+    var targetCharacteristicScore: Int = Int.max // Lower score means better candidate
 
 
     var flutterResult: FlutterResult? //para el resul de flutter
@@ -116,6 +117,10 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegat
           result(false)
           return
         }
+        // Reset selection state for the next discovery cycle.
+        self.targetService = nil
+        self.targetCharacteristic = nil
+        self.targetCharacteristicScore = Int.max
         // Busca el dispositivo con la dirección MAC dada
         let peripherals = centralManager?.retrievePeripherals(withIdentifiers: [uuid])
         guard let peripheral = peripherals?.first else {
@@ -322,6 +327,7 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegat
             self.flutterResult?(true)
         }
         targetCharacteristic = nil
+        targetCharacteristicScore = Int.max
         //la respuesta va en centralManager segunda funcion
         //result(true)
       } else {
@@ -395,29 +401,24 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegat
                 CBUUID(string: "00001101-0000-1000-8000-00805F9B34FB")
             ]
 
-            var selected: CBCharacteristic?
+            let printerServiceUUID = CBUUID(string: "49535343-FE7D-4AE5-8FA9-9FAFD205E455")
+            let servicePenalty = (service.uuid == printerServiceUUID) ? 0 : 100
 
-            for preferred in priority {
-                if let c = discoveredCharacteristics.first(where: { $0.uuid == preferred }) {
-                    let writable = c.properties.contains(.write) || c.properties.contains(.writeWithoutResponse)
-                    print("characteristics found: \(c.uuid) writable=\(writable) props=\(c.properties.rawValue)")
-                    if writable {
-                        selected = c
-                        break
-                    }
+            for c in discoveredCharacteristics {
+                let writable = c.properties.contains(.write) || c.properties.contains(.writeWithoutResponse)
+                print("characteristics found: \(c.uuid) writable=\(writable) props=\(c.properties.rawValue)")
+                if !writable { continue }
+
+                let priorityIndex = priority.firstIndex(of: c.uuid) ?? 50
+                let score = servicePenalty + priorityIndex
+
+                // Keep the best global candidate across all discovered services.
+                if score < targetCharacteristicScore {
+                    targetCharacteristicScore = score
+                    targetCharacteristic = c
+                    targetService = service
+                    print("Target characteristic found: \(c.uuid) props=\(c.properties.rawValue) score=\(score) service=\(service.uuid)")
                 }
-            }
-
-            // Fallback: any writable characteristic in this service.
-            if selected == nil {
-                selected = discoveredCharacteristics.first(where: {
-                    $0.properties.contains(.write) || $0.properties.contains(.writeWithoutResponse)
-                })
-            }
-
-            if let chosen = selected {
-                targetCharacteristic = chosen
-                print("Target characteristic found: \(chosen.uuid) props=\(chosen.properties.rawValue)")
             }
         }
     }
