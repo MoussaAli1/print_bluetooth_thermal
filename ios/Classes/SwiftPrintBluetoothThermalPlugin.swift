@@ -75,42 +75,60 @@ public class SwiftPrintBluetoothThermalPlugin: NSObject, CBCentralManagerDelegat
         }
       }
     } else if call.method == "pairedbluetooths" {
-      //print("buscando bluetooths");
-      //let discoveredDevices = scanForBluetoothDevices(duration: 5.0)
-      //print("Discovered devices: \(discoveredDevices)")
-      switch centralManager?.state {
-        case .unknown:
-            //print("El estado del bluetooth es desconocido")
-            break
-        case .resetting:
-            //print("El bluetooth se está reiniciando")
-            break
-        case .unsupported:
-            //print("El bluetooth no es compatible con este dispositivo")
-            break
-        case .unauthorized:
-            //print("El bluetooth no está autorizado para esta app")
-            break
-        case .poweredOff:
-            //print("El bluetooth está apagado")
-            centralManager?.stopScan()
-        case .poweredOn:
-            //print("El bluetooth está encendido")
-            //Escanea todos los bluetooths disponibles
-            centralManager?.scanForPeripherals(withServices: nil, options: nil)
-            // Escanea todos los dispositivos Bluetooth vinculados
-            centralManager?.retrieveConnectedPeripherals(withServices: [])
-        @unknown default:
-            //print("El estado del bluetooth es desconocido (default)")
-            break
+      // First scan on iOS can race with CBCentralManager initialization
+      // (state=.unknown/.resetting). In that case the old behavior returned
+      // an empty list immediately, while retry worked. We now defer scan
+      // start briefly and include already-connected peripherals instantly.
+      self.discoveredDevices.removeAll()
+
+      func addConnectedPeripherals() {
+        let connected = self.centralManager?.retrieveConnectedPeripherals(withServices: []) ?? []
+        for p in connected {
+            if let deviceName = p.name {
+                let device = "\(deviceName)#\(p.identifier.uuidString)"
+                if !self.discoveredDevices.contains(device) {
+                    self.discoveredDevices.append(device)
+                }
+            }
+        }
       }
 
-        // despues de 5 segundos se para la busqueda y se devuelve la lista de dispositivos disponibles
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+      func startScanWindow(scanSeconds: Double) {
+        self.centralManager?.scanForPeripherals(withServices: nil, options: nil)
+        addConnectedPeripherals()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + scanSeconds) {
             self.centralManager?.stopScan()
             print("Stopped scanning -> Discovered devices: \(self.discoveredDevices.count)")
             result(self.discoveredDevices)
         }
+      }
+
+      switch centralManager?.state {
+        case .unknown, .resetting:
+            // Wait a moment for CoreBluetooth to transition to poweredOn,
+            // then run a full scan window.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                if self.centralManager?.state == .poweredOn {
+                    startScanWindow(scanSeconds: 5.0)
+                } else {
+                    // Still not ready; return whatever connected devices we can see.
+                    addConnectedPeripherals()
+                    print("Stopped scanning -> Discovered devices: \(self.discoveredDevices.count)")
+                    result(self.discoveredDevices)
+                }
+            }
+        case .poweredOff:
+            self.centralManager?.stopScan()
+            print("Stopped scanning -> Discovered devices: 0")
+            result([])
+        case .poweredOn:
+            startScanWindow(scanSeconds: 5.0)
+        case .unsupported, .unauthorized:
+            result([])
+        @unknown default:
+            result([])
+      }
 
     } 
     else if call.method == "connect"{
